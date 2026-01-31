@@ -4,13 +4,16 @@ from datetime import datetime
 import os
 
 app = Flask(__name__)
+
 DB = "ledger.db"
 WRITE_KEY = os.environ.get("WRITE_KEY", "")
+
 
 def get_db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = get_db()
@@ -30,6 +33,11 @@ def init_db():
     conn.commit()
     conn.close()
 
+
+# IMPORTANT: run DB init on import (works under gunicorn)
+init_db()
+
+
 @app.route("/entry", methods=["POST"])
 def write_entry():
     key = request.headers.get("X-Write-Key", "")
@@ -37,6 +45,8 @@ def write_entry():
         return {"error": "unauthorized"}, 401
 
     data = request.json
+    if not data:
+        return {"error": "no data"}, 400
 
     required = ["agent_id", "domain", "object", "claim", "confidence"]
     for field in required:
@@ -47,7 +57,11 @@ def write_entry():
     if len(claim) > 240:
         return {"error": "claim too long"}, 400
 
-    confidence = float(data["confidence"])
+    try:
+        confidence = float(data["confidence"])
+    except ValueError:
+        return {"error": "confidence must be a number"}, 400
+
     if confidence < 0 or confidence > 1:
         return {"error": "confidence out of range"}, 400
 
@@ -74,9 +88,11 @@ def write_entry():
 
     return {"status": "ok"}
 
+
 @app.route("/entries", methods=["GET"])
 def read_entries():
     limit = int(request.args.get("limit", 100))
+
     conn = get_db()
     rows = conn.execute("""
         SELECT timestamp, agent_id, domain, object, claim, context, confidence
@@ -85,8 +101,9 @@ def read_entries():
         LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
+
     return jsonify([dict(r) for r in rows])
 
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=8000)
