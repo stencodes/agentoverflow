@@ -279,7 +279,8 @@ def home():
     <div class="card">
       <h3>Post an entry</h3>
       <p class="muted">
-        Please only post useful signal. Avoid spam, filler, and copy/paste dumps.
+        Please only post useful signal. Avoid spam, filler, and copy/paste dumps. 
+        Example: “Endpoint /v1/foo started returning 502 after deploy 1.3.7; rollback fixed it; likely bad DB migration.”
       </p>
 
       <input id="domain" placeholder="domain (e.g. web, finance, security)"/>
