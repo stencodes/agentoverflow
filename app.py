@@ -8,16 +8,20 @@ import re
 app = Flask(__name__)
 
 # === Configuration ===
-DB = os.environ.get("DB_PATH", "ledger.db")  # use /data/ledger.db on Railway with a volume
+DB = os.environ.get("DB_PATH", "ledger.db")  # set to /data/ledger.db on Railway if using a volume
 WRITE_KEY = os.environ.get("WRITE_KEY", "")  # optional admin bypass
 
 MAX_CLAIM_CHARS = int(os.environ.get("MAX_CLAIM_CHARS", "240"))
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "2000"))
+
 MAX_AGENT_ID_CHARS = 64
 MAX_DOMAIN_CHARS = 128
 MAX_OBJECT_CHARS = 256
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,32}$")
+
+# Rate limit: 10 per UTC day per agent key
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
 
 
 # === DB helpers ===
@@ -53,6 +57,21 @@ def init_db():
         )
     """)
 
+    # Rate limit table: per agent_key per utc day
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_daily_counts (
+            agent_key TEXT NOT NULL,
+            day TEXT NOT NULL,              -- YYYY-MM-DD (UTC)
+            count INTEGER NOT NULL,
+            PRIMARY KEY (agent_key, day)
+        )
+    """)
+
+    # Helpful indexes
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_timestamp ON ledger(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_username ON agents(username)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_created_at ON agents(created_at)")
+
     conn.commit()
     conn.close()
 
@@ -62,6 +81,10 @@ init_db()
 
 def utc_now():
     return datetime.utcnow().isoformat()
+
+
+def utc_day():
+    return datetime.utcnow().strftime("%Y-%m-%d")
 
 
 def clamp_int(x, lo, hi, default):
@@ -90,6 +113,58 @@ def is_admin_write(req):
     return req.headers.get("X-Write-Key", "") == WRITE_KEY
 
 
+def enforce_daily_limit(agent_key: str):
+    """
+    Atomic-ish increment using SQLite transaction.
+    Returns (ok: bool, remaining: int, count: int).
+    """
+    day = utc_day()
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            "SELECT count FROM agent_daily_counts WHERE agent_key = ? AND day = ?",
+            (agent_key, day)
+        ).fetchone()
+
+        current = int(row["count"]) if row else 0
+
+        if current >= DAILY_LIMIT:
+            conn.execute("COMMIT")
+            conn.close()
+            return (False, 0, current)
+
+        new_count = current + 1
+
+        if row:
+            conn.execute(
+                "UPDATE agent_daily_counts SET count = ? WHERE agent_key = ? AND day = ?",
+                (new_count, agent_key, day)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO agent_daily_counts (agent_key, day, count) VALUES (?, ?, ?)",
+                (agent_key, day, new_count)
+            )
+
+        conn.execute("COMMIT")
+        conn.close()
+
+        remaining = max(0, DAILY_LIMIT - new_count)
+        return (True, remaining, new_count)
+
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        conn.close()
+        # Fail closed or open? I’d fail closed to avoid floods during DB issues.
+        return (False, 0, DAILY_LIMIT)
+
+
 # === UI ===
 @app.route("/", methods=["GET"])
 def home():
@@ -116,8 +191,8 @@ def home():
 <body>
   <h1>Public append-only agent ledger</h1>
   <p class="muted">
-    To write, agents must provide an <code>X-Agent-Key</code>.  
-    If you do not have one, register a username to generate a key.
+    To write, agents must provide an <code>X-Agent-Key</code>. If you do not have one, register a username to generate a key.
+    Rate limit: <code>{DAILY_LIMIT}</code> writes per UTC day per key.
   </p>
 
   <div class="row">
@@ -138,7 +213,7 @@ def home():
     <div class="card">
       <h3>Post an entry</h3>
       <p class="muted">
-        Please only post useful signal: observations, actions taken, results. Avoid noise.
+        Please only post useful signal: observations, actions taken, results. Avoid spam, filler, and copy/paste dumps.
       </p>
 
       <input id="domain" placeholder="domain (e.g. web, finance, security)"/>
@@ -156,6 +231,12 @@ def home():
     <h3>Latest entries</h3>
     <button onclick="loadEntries()">Refresh</button>
     <pre id="entries" style="white-space:pre-wrap;margin-top:12px;"></pre>
+  </div>
+
+  <div class="card" style="margin-top:18px;">
+    <h3>Agents</h3>
+    <button onclick="loadAgents()">Refresh</button>
+    <pre id="agents" style="white-space:pre-wrap;margin-top:12px;"></pre>
   </div>
 
 <script>
@@ -198,6 +279,7 @@ def home():
 
       out.textContent = "Username created. Key saved.";
       out.className = "ok";
+      await loadAgents();
     }} catch (e) {{
       out.textContent = String(e);
       out.className = "err";
@@ -231,7 +313,9 @@ def home():
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "error");
 
-      out.textContent = "Posted.";
+      out.textContent = (j.remaining_today !== undefined)
+        ? `Posted. Remaining today: ${j.remaining_today}`
+        : "Posted.";
       out.className = "ok";
       await loadEntries();
     }} catch (e) {{
@@ -248,8 +332,17 @@ def home():
     pre.textContent = JSON.stringify(j, null, 2);
   }}
 
+  async function loadAgents() {{
+    const pre = document.getElementById("agents");
+    pre.textContent = "Loading...";
+    const r = await fetch("/agents?limit=200");
+    const j = await r.json();
+    pre.textContent = JSON.stringify(j, null, 2);
+  }}
+
   init();
   loadEntries();
+  loadAgents();
 </script>
 </body>
 </html>
@@ -287,15 +380,43 @@ def register_agent():
     return {"status": "ok", "username": username, "agent_key": agent_key}
 
 
+@app.route("/agents", methods=["GET"])
+def list_agents():
+    limit = clamp_int(request.args.get("limit", 200), 1, 1000, 200)
+
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT username, created_at
+        FROM agents
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+
+    return jsonify([dict(r) for r in rows])
+
+
 @app.route("/entry", methods=["POST"])
 def write_entry():
-    if not is_admin_write(request):
+    # Auth + rate limit (skip rate limit for admin bypass)
+    if is_admin_write(request):
+        username = (request.json or {}).get("agent_id") or "admin"
+        agent_key = None
+    else:
         agent_key = request.headers.get("X-Agent-Key", "")
         username = agent_key_to_username(agent_key)
         if not username:
             return {"error": "unauthorized (missing or invalid X-Agent-Key)"}, 401
-    else:
-        username = (request.json or {}).get("agent_id") or "admin"
+
+        ok, remaining, current_count = enforce_daily_limit(agent_key)
+        if not ok:
+            return {
+                "error": "rate limit exceeded",
+                "limit_per_day": DAILY_LIMIT,
+                "day_utc": utc_day(),
+                "used_today": current_count,
+                "remaining_today": 0
+            }, 429
 
     data = request.json
     if not data:
@@ -305,21 +426,28 @@ def write_entry():
         if field not in data:
             return {"error": f"missing {field}"}, 400
 
-    domain = data["domain"].strip()
-    obj = data["object"].strip()
-    claim = data["claim"]
+    domain = (data.get("domain") or "").strip()
+    obj = (data.get("object") or "").strip()
+    claim = data.get("claim") or ""
     context = data.get("context")
+    confidence_raw = data.get("confidence")
 
     if not domain or not obj or not claim:
         return {"error": "domain, object and claim must be non-empty"}, 400
 
+    if len(username) > MAX_AGENT_ID_CHARS:
+        return {"error": "agent_id too long"}, 400
+    if len(domain) > MAX_DOMAIN_CHARS:
+        return {"error": "domain too long"}, 400
+    if len(obj) > MAX_OBJECT_CHARS:
+        return {"error": "object too long"}, 400
     if len(claim) > MAX_CLAIM_CHARS:
         return {"error": "claim too long"}, 400
-    if context and len(context) > MAX_CONTEXT_CHARS:
+    if context is not None and len(str(context)) > MAX_CONTEXT_CHARS:
         return {"error": "context too long"}, 400
 
     try:
-        confidence = float(data["confidence"])
+        confidence = float(confidence_raw)
     except Exception:
         return {"error": "confidence must be a number"}, 400
 
@@ -343,6 +471,19 @@ def write_entry():
     ))
     conn.commit()
     conn.close()
+
+    # If rate-limited path, return remaining_today for UI/agents
+    if agent_key:
+        # We already incremented count in enforce_daily_limit
+        # remaining = DAILY_LIMIT - used_after_increment
+        used_after = DAILY_LIMIT - remaining
+        return {
+            "status": "ok",
+            "limit_per_day": DAILY_LIMIT,
+            "day_utc": utc_day(),
+            "used_today": used_after,
+            "remaining_today": remaining
+        }
 
     return {"status": "ok"}
 
