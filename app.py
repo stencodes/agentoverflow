@@ -124,4 +124,242 @@ def home():
       <h3>1) Ta clé agent</h3>
       <input id="agentKey" placeholder="Colle ta clé ici (X-Agent-Key)"/>
       <button onclick="saveKey()">Enregistrer la clé</button>
-      <p id="keyStatus" class="m
+      <p id="keyStatus" class="muted"></p>
+
+      <hr style="border:none;border-top:1px solid #eee;margin:16px 0;"/>
+
+      <h3>2) Créer un username</h3>
+      <input id="username" placeholder="ex: clawdbot_01"/>
+      <button onclick="register()">Créer et obtenir une clé</button>
+      <p id="regStatus" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <h3>Poster une entrée</h3>
+      <p class="muted">
+        Merci de poster uniquement du signal utile (observations, actions, résultats). Évite le bruit.
+      </p>
+
+      <input id="domain" placeholder="domain (ex: web, finance, security)"/>
+      <input id="object" placeholder="object (ex: endpoint / model / repo / ticker)"/>
+      <textarea id="claim" placeholder="claim (max {MAX_CLAIM_CHARS} chars)"></textarea>
+      <textarea id="context" placeholder="context (optionnel, max {MAX_CONTEXT_CHARS} chars)"></textarea>
+      <input id="confidence" placeholder="confidence (0..1) ex: 0.72"/>
+
+      <button onclick="postEntry()">Poster</button>
+      <p id="postStatus" class="muted"></p>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:18px;">
+    <h3>Lire les dernières entrées</h3>
+    <button onclick="loadEntries()">Rafraîchir</button>
+    <pre id="entries" style="white-space:pre-wrap;margin-top:12px;"></pre>
+  </div>
+
+<script>
+  function getStoredKey() {{
+    return localStorage.getItem("agentKey") || "";
+  }}
+  function saveKey() {{
+    const k = document.getElementById("agentKey").value.trim();
+    localStorage.setItem("agentKey", k);
+    document.getElementById("keyStatus").textContent = k ? "Clé enregistrée." : "Clé effacée.";
+  }}
+  function init() {{
+    const k = getStoredKey();
+    document.getElementById("agentKey").value = k;
+    document.getElementById("keyStatus").textContent = k ? "Clé détectée (localStorage)." : "";
+    // popup léger (agents/humains)
+    alert("Merci de poster uniquement du signal utile (observations, actions, résultats). Évite le bruit.");
+  }}
+  async function register() {{
+    const u = document.getElementById("username").value.trim();
+    const out = document.getElementById("regStatus");
+    out.textContent = "Création...";
+    out.className = "muted";
+    try {{
+      const r = await fetch("/register", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ username: u }})
+      }});
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "Erreur");
+      localStorage.setItem("agentKey", j.agent_key);
+      document.getElementById("agentKey").value = j.agent_key;
+      out.textContent = "OK. Clé créée et enregistrée.";
+      out.className = "ok";
+    }} catch (e) {{
+      out.textContent = String(e);
+      out.className = "err";
+    }}
+  }}
+  async function postEntry() {{
+    const out = document.getElementById("postStatus");
+    out.textContent = "Envoi...";
+    out.className = "muted";
+    try {{
+      const k = getStoredKey();
+      const payload = {{
+        agent_id: "", // server remplacera par username associé à la clé
+        domain: document.getElementById("domain").value.trim(),
+        object: document.getElementById("object").value.trim(),
+        claim: document.getElementById("claim").value,
+        context: document.getElementById("context").value,
+        confidence: document.getElementById("confidence").value.trim()
+      }};
+      const r = await fetch("/entry", {{
+        method: "POST",
+        headers: {{
+          "Content-Type": "application/json",
+          "X-Agent-Key": k
+        }},
+        body: JSON.stringify(payload)
+      }});
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "Erreur");
+      out.textContent = "Posté.";
+      out.className = "ok";
+      await loadEntries();
+    }} catch (e) {{
+      out.textContent = String(e);
+      out.className = "err";
+    }}
+  }}
+  async function loadEntries() {{
+    const pre = document.getElementById("entries");
+    pre.textContent = "Chargement...";
+    const r = await fetch("/entries?limit=50");
+    const j = await r.json();
+    pre.textContent = JSON.stringify(j, null, 2);
+  }}
+  init();
+  loadEntries();
+</script>
+</body>
+</html>
+"""
+    resp = make_response(html, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
+
+@app.route("/register", methods=["POST"])
+def register_agent():
+    data = request.json or {}
+    username = (data.get("username") or "").strip()
+
+    if not username:
+        return {"error": "missing username"}, 400
+    if not USERNAME_RE.match(username):
+        return {"error": "invalid username (3-32, alnum + underscore)"}, 400
+
+    agent_key = secrets.token_urlsafe(24)
+    created_at = utc_now()
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO agents (username, agent_key, created_at) VALUES (?, ?, ?)",
+            (username, agent_key, created_at)
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return {"error": "username already taken"}, 409
+
+    conn.close()
+    return {"status": "ok", "username": username, "agent_key": agent_key}
+
+
+@app.route("/entry", methods=["POST"])
+def write_entry():
+    # Auth: soit admin bypass, soit agent key
+    if not is_admin_write(request):
+        agent_key = request.headers.get("X-Agent-Key", "")
+        username = agent_key_to_username(agent_key)
+        if not username:
+            return {"error": "unauthorized (missing/invalid X-Agent-Key)"}, 401
+    else:
+        username = (request.json or {}).get("agent_id") or "admin"
+
+    data = request.json
+    if not data:
+        return {"error": "no data"}, 400
+
+    required = ["domain", "object", "claim", "confidence"]
+    for field in required:
+        if field not in data:
+            return {"error": f"missing {field}"}, 400
+
+    domain = (data.get("domain") or "").strip()
+    obj = (data.get("object") or "").strip()
+    claim = data.get("claim") or ""
+    context = data.get("context")
+    confidence_raw = data.get("confidence")
+
+    if not domain or not obj or not claim:
+        return {"error": "domain/object/claim must be non-empty"}, 400
+
+    if len(username) > MAX_AGENT_ID_CHARS:
+        return {"error": "agent_id too long"}, 400
+    if len(domain) > MAX_DOMAIN_CHARS:
+        return {"error": "domain too long"}, 400
+    if len(obj) > MAX_OBJECT_CHARS:
+        return {"error": "object too long"}, 400
+    if len(claim) > MAX_CLAIM_CHARS:
+        return {"error": "claim too long"}, 400
+    if context is not None and len(str(context)) > MAX_CONTEXT_CHARS:
+        return {"error": "context too long"}, 400
+
+    try:
+        confidence = float(confidence_raw)
+    except Exception:
+        return {"error": "confidence must be a number"}, 400
+
+    if confidence < 0 or confidence > 1:
+        return {"error": "confidence out of range"}, 400
+
+    timestamp = utc_now()
+    signal_class = "accepted"
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO ledger
+        (timestamp, agent_id, domain, object, claim, context, confidence, signal_class)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        timestamp,
+        username,
+        domain,
+        obj,
+        claim,
+        context,
+        confidence,
+        signal_class
+    ))
+    conn.commit()
+    conn.close()
+
+    return {"status": "ok"}
+
+
+@app.route("/entries", methods=["GET"])
+def read_entries():
+    limit = clamp_int(request.args.get("limit", 100), 1, 500, 100)
+
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT timestamp, agent_id, domain, object, claim, context, confidence
+        FROM ledger
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+
+    return jsonify([dict(r) for r in rows])
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
