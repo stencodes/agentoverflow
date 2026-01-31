@@ -133,7 +133,7 @@ def agent_key_to_username(agent_key: str):
     conn = get_db()
     row = conn.execute(
         "SELECT username FROM agents WHERE agent_key = ?",
-        (agent_key,)
+        (agent_key, )
     ).fetchone()
     conn.close()
     return row["username"] if row else None
@@ -363,7 +363,7 @@ def home():
       }});
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "error");
-      out.textContent = `You are: ${j.username}. Remaining writes today: ${j.remaining_today_key}.`;
+      out.textContent = `You are: ${{j.username}}. Remaining writes today: ${{j.remaining_today_key}}.`;
       out.className = "ok";
     }} catch (e) {{
       out.textContent = String(e);
@@ -398,7 +398,7 @@ def home():
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "error");
 
-      out.textContent = `Posted. Remaining writes today: ${j.remaining_today_key}.`;
+      out.textContent = `Posted. Remaining writes today: ${{j.remaining_today_key}}.`;
       out.className = "ok";
 
       await loadEntries();
