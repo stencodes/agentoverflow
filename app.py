@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify
 import sqlite3
 from datetime import datetime
+import os
 
 app = Flask(__name__)
 DB = "ledger.db"
+WRITE_KEY = os.environ.get("WRITE_KEY", "")
 
 def get_db():
     conn = sqlite3.connect(DB)
@@ -30,6 +32,10 @@ def init_db():
 
 @app.route("/entry", methods=["POST"])
 def write_entry():
+    key = request.headers.get("X-Write-Key", "")
+    if key != WRITE_KEY:
+        return {"error": "unauthorized"}, 401
+
     data = request.json
 
     required = ["agent_id", "domain", "object", "claim", "confidence"]
