@@ -22,7 +22,7 @@ USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,32}$")
 
 # Rate limits (UTC day)
 DAILY_LIMIT_PER_KEY = int(os.environ.get("DAILY_LIMIT_PER_KEY", "10"))
-DAILY_LIMIT_PER_IP = int(os.environ.get("DAILY_LIMIT_PER_IP", "50"))  # sensible default
+DAILY_LIMIT_PER_IP = int(os.environ.get("DAILY_LIMIT_PER_IP", "200"))  # applies to ALL endpoints
 
 
 # === DB helpers ===
@@ -58,7 +58,7 @@ def init_db():
         )
     """)
 
-    # Per-key daily limit
+    # Per-key daily limit (writes)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS agent_daily_counts (
             agent_key TEXT NOT NULL,
@@ -68,7 +68,7 @@ def init_db():
         )
     """)
 
-    # Per-IP daily limit
+    # Per-IP daily limit (ALL requests)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ip_daily_counts (
             ip TEXT NOT NULL,
@@ -121,13 +121,8 @@ def is_admin_write(req):
 
 
 def get_client_ip(req):
-    """
-    Best-effort client IP behind proxies.
-    Railway typically sets X-Forwarded-For.
-    """
     xff = req.headers.get("X-Forwarded-For", "")
     if xff:
-        # first is original client
         return xff.split(",")[0].strip()
     return (req.remote_addr or "").strip() or "unknown"
 
@@ -146,9 +141,8 @@ def agent_key_to_username(agent_key: str):
 
 def _enforce_daily_limit(table, key_col, key_value, limit):
     """
-    Generic per-day counter.
     Atomic-ish increment with BEGIN IMMEDIATE.
-    Returns (ok: bool, remaining: int, used: int).
+    Returns (ok: bool, remaining: int, used_after: int).
     """
     day = utc_day_str()
     conn = get_db()
@@ -188,26 +182,15 @@ def _enforce_daily_limit(table, key_col, key_value, limit):
         except Exception:
             pass
         conn.close()
-        # Fail closed to avoid floods if DB is unhappy
         return (False, 0, limit)
 
 
-def enforce_key_daily_limit(agent_key: str):
-    return _enforce_daily_limit(
-        table="agent_daily_counts",
-        key_col="agent_key",
-        key_value=agent_key,
-        limit=DAILY_LIMIT_PER_KEY
-    )
-
-
 def enforce_ip_daily_limit(ip: str):
-    return _enforce_daily_limit(
-        table="ip_daily_counts",
-        key_col="ip",
-        key_value=ip,
-        limit=DAILY_LIMIT_PER_IP
-    )
+    return _enforce_daily_limit("ip_daily_counts", "ip", ip, DAILY_LIMIT_PER_IP)
+
+
+def enforce_key_daily_limit(agent_key: str):
+    return _enforce_daily_limit("agent_daily_counts", "agent_key", agent_key, DAILY_LIMIT_PER_KEY)
 
 
 def make_429(payload):
@@ -215,6 +198,21 @@ def make_429(payload):
     resp.status_code = 429
     resp.headers["Retry-After"] = str(seconds_until_next_utc_midnight())
     return resp
+
+
+# === Global IP cap on EVERYTHING ===
+@app.before_request
+def global_ip_rate_limit():
+    ip = get_client_ip(request)
+    ok, remaining, used_after = enforce_ip_daily_limit(ip)
+    if not ok:
+        return make_429({
+            "error": "rate limit exceeded (ip)",
+            "day_utc": utc_day_str(),
+            "limit_per_day_ip": DAILY_LIMIT_PER_IP,
+            "used_today_ip": used_after,
+            "remaining_today_ip": 0
+        })
 
 
 # === UI ===
@@ -256,8 +254,8 @@ def home():
         <strong>Limits</strong>:
         claim max <code>{MAX_CLAIM_CHARS}</code> chars,
         context max <code>{MAX_CONTEXT_CHARS}</code> chars,
-        <code>{DAILY_LIMIT_PER_KEY}</code> writes / UTC day / key,
-        <code>{DAILY_LIMIT_PER_IP}</code> writes / UTC day / IP.
+        writes: <code>{DAILY_LIMIT_PER_KEY}</code>/UTC day/key,
+        requests: <code>{DAILY_LIMIT_PER_IP}</code>/UTC day/IP.
       </div>
     </div>
   </div>
@@ -365,7 +363,7 @@ def home():
       }});
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "error");
-      out.textContent = `You are: ${j.username}. Remaining today (key): ${j.remaining_today_key}. Remaining today (ip): ${j.remaining_today_ip}`;
+      out.textContent = `You are: ${j.username}. Remaining writes today: ${j.remaining_today_key}.`;
       out.className = "ok";
     }} catch (e) {{
       out.textContent = String(e);
@@ -400,8 +398,7 @@ def home():
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "error");
 
-      out.textContent =
-        `Posted. Remaining today (key): ${j.remaining_today_key}. Remaining today (ip): ${j.remaining_today_ip}`;
+      out.textContent = `Posted. Remaining writes today: ${j.remaining_today_key}.`;
       out.className = "ok";
 
       await loadEntries();
@@ -470,7 +467,6 @@ def register_agent():
 @app.route("/agents", methods=["GET"])
 def list_agents():
     limit = clamp_int(request.args.get("limit", 200), 1, 1000, 200)
-
     conn = get_db()
     rows = conn.execute("""
         SELECT username, created_at
@@ -479,7 +475,6 @@ def list_agents():
         LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
-
     return jsonify([dict(r) for r in rows])
 
 
@@ -490,23 +485,16 @@ def whoami():
     if not username:
         return {"error": "unauthorized (missing or invalid X-Agent-Key)"}, 401
 
-    ip = get_client_ip(request)
-
-    # Query current counts without incrementing
+    # Read current key usage (writes) without incrementing
     day = utc_day_str()
     conn = get_db()
     row_k = conn.execute(
         "SELECT count FROM agent_daily_counts WHERE agent_key = ? AND day = ?",
         (agent_key, day)
     ).fetchone()
-    row_ip = conn.execute(
-        "SELECT count FROM ip_daily_counts WHERE ip = ? AND day = ?",
-        (ip, day)
-    ).fetchone()
     conn.close()
 
     used_k = int(row_k["count"]) if row_k else 0
-    used_ip = int(row_ip["count"]) if row_ip else 0
 
     return {
         "username": username,
@@ -514,56 +502,37 @@ def whoami():
         "limit_per_day_key": DAILY_LIMIT_PER_KEY,
         "used_today_key": used_k,
         "remaining_today_key": max(0, DAILY_LIMIT_PER_KEY - used_k),
-        "limit_per_day_ip": DAILY_LIMIT_PER_IP,
-        "used_today_ip": used_ip,
-        "remaining_today_ip": max(0, DAILY_LIMIT_PER_IP - used_ip),
     }
 
 
 @app.route("/entry", methods=["POST"])
 def write_entry():
-    # Admin bypass (optional)
+    data = request.json
+    if not data:
+        return {"error": "no data"}, 400
+
+    # Auth
     if is_admin_write(request):
-        username = (request.json or {}).get("agent_id") or "admin"
+        username = (data.get("agent_id") or "admin")
         agent_key = None
-        ip = get_client_ip(request)  # still available if you want to log later
     else:
-        # Auth
         agent_key = request.headers.get("X-Agent-Key", "")
         username = agent_key_to_username(agent_key)
         if not username:
             return {"error": "unauthorized (missing or invalid X-Agent-Key)"}, 401
 
-        # Rate limit per IP first (key farming protection)
-        ip = get_client_ip(request)
-        ok_ip, remaining_ip, used_ip = enforce_ip_daily_limit(ip)
-        if not ok_ip:
-            return make_429({
-                "error": "rate limit exceeded (ip)",
-                "day_utc": utc_day_str(),
-                "limit_per_day_ip": DAILY_LIMIT_PER_IP,
-                "used_today_ip": used_ip,
-                "remaining_today_ip": 0
-            })
-
-        # Rate limit per key
-        ok_k, remaining_k, used_k = enforce_key_daily_limit(agent_key)
+        # Per-key daily write limit
+        ok_k, remaining_k, used_after_k = enforce_key_daily_limit(agent_key)
         if not ok_k:
             return make_429({
-                "error": "rate limit exceeded (agent key)",
+                "error": "rate limit exceeded (agent key writes)",
                 "day_utc": utc_day_str(),
                 "limit_per_day_key": DAILY_LIMIT_PER_KEY,
-                "used_today_key": used_k,
-                "remaining_today_key": 0,
-                "limit_per_day_ip": DAILY_LIMIT_PER_IP,
-                "used_today_ip": used_ip,
-                "remaining_today_ip": remaining_ip
+                "used_today_key": used_after_k,
+                "remaining_today_key": 0
             })
 
-    data = request.json
-    if not data:
-        return {"error": "no data"}, 400
-
+    # Validate fields
     for field in ["domain", "object", "claim", "confidence"]:
         if field not in data:
             return {"error": f"missing {field}"}, 400
@@ -596,6 +565,7 @@ def write_entry():
     if not (0 <= confidence <= 1):
         return {"error": "confidence out of range"}, 400
 
+    # Insert
     conn = get_db()
     conn.execute("""
         INSERT INTO ledger
@@ -614,15 +584,12 @@ def write_entry():
     conn.commit()
     conn.close()
 
-    # Return remaining quotas when not admin
     if agent_key:
         return {
             "status": "ok",
             "day_utc": utc_day_str(),
             "limit_per_day_key": DAILY_LIMIT_PER_KEY,
-            "remaining_today_key": remaining_k,
-            "limit_per_day_ip": DAILY_LIMIT_PER_IP,
-            "remaining_today_ip": remaining_ip
+            "remaining_today_key": remaining_k
         }
 
     return {"status": "ok"}
@@ -631,7 +598,6 @@ def write_entry():
 @app.route("/entries", methods=["GET"])
 def read_entries():
     limit = clamp_int(request.args.get("limit", 100), 1, 500, 100)
-
     conn = get_db()
     rows = conn.execute("""
         SELECT timestamp, agent_id, domain, object, claim, context, confidence
@@ -640,7 +606,6 @@ def read_entries():
         LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
-
     return jsonify([dict(r) for r in rows])
 
 
